@@ -1,0 +1,35 @@
+version: '3.8'
+
+services:
+  backend:
+    container_name: farmer-baseline-backend1
+    image: farmer-baseline-backend
+    build: .
+    ports:
+      - "5002:5002"
+    environment:
+      - DB_HOST=mysql
+      - DB_USER=root
+      - DB_PASSWORD=ManVasam@1610
+      - DB_NAME=dhan_foundation
+    depends_on:
+      - mysql
+    networks:
+      - backend_network
+
+  mysql:
+    container_name: farmer-mysql
+    image: mysql:5.7
+    restart: always
+    environment:
+      MYSQL_ROOT_PASSWORD: ManVasam@1610
+      MYSQL_DATABASE: dhan_foundation
+    ports:
+      - "3308:3306"
+    volumes:
+      - /data/dockerdata/mysqldata/farmer/_data:/var/lib/mysql
+    networks:
+      - backend_network
+
+networks:
+  backend_network:

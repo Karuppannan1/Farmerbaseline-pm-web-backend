@@ -1,0 +1,1496 @@
+const express = require('express');
+const bodyParser = require('body-parser');
+const mysql = require('mysql2');
+const cors = require('cors');
+const app = express();
+app.use(cors());
+require('dotenv').config(); 
+
+// const port = 5000;
+const port = process.env.PORT || 5002;
+
+app.use(bodyParser.json()); // <--- ADD THIS LINE HERE!
+
+const pool = mysql.createPool({
+connectionLimit: process.env.DB_CONNECTION_LIMIT || 10, // Adjust as needed
+host: process.env.DB_HOST,
+user: process.env.DB_USER,
+database: process.env.DB_DATABASE,
+password: process.env.DB_PASSWORD
+
+});
+
+
+//testing
+
+app.get('/api/farmers/enriched', async (req, res) => {
+  try {
+    // Check cache first (remove this if you want real-time data)
+    const cachedData = dataCache.get('enriched_farmers');
+    if (cachedData) {
+      console.log('Serving from cache');
+      return res.json(cachedData);
+    }
+
+    console.time('enriched-farmers-query');
+    
+    // Single query with ALL joins - no separate API calls needed
+    const query = `
+      SELECT 
+        m.*,
+        s.state_sname,
+        d.district_dname,
+        l.location_lname,
+        c.cluster_cname,
+        g.group_cname,
+        cm1.cname as cropname1,
+        cv1.cvariety as variety1,
+        csv1.subvariety as subvariety1,
+        cm2.cname as cropname2,
+        cv2.cvariety as variety2,
+        csv2.subvariety as subvariety2,
+        cm3.cname as cropname3,
+        cv3.cvariety as variety3,
+        csv3.subvariety as subvariety3,
+        cm.cname as cropname,
+        cv.cvariety as variety,
+        csv.subvariety as subvariety,
+        acm.acname as cropname6,
+        acv.acvariety as variety6,
+        acsv.asubvariety as subvariety6
+      FROM myfarmers_data m
+      LEFT JOIN state s ON m.state_scode = s.state_scode
+      LEFT JOIN district d ON m.district_dcode = d.district_dcode
+      LEFT JOIN location l ON m.location_lcode = l.location_lcode
+      LEFT JOIN cluster c ON m.cluster_ccode = c.cluster_ccode
+      LEFT JOIN grp g ON m.group_gcode = g.group_gcode
+      LEFT JOIN cropmaster1 cm1 ON m.ccode1 = cm1.ccode1
+      LEFT JOIN cropvariety1 cv1 ON m.ccode1 = cv1.ccode1 AND m.v_id1 = cv1.v_id1
+      LEFT JOIN cropsubvariety1 csv1 ON m.sv_id1 = csv1.sv_id1
+      LEFT JOIN cropmaster2 cm2 ON m.ccode2 = cm2.ccode2
+      LEFT JOIN cropvariety2 cv2 ON m.ccode2 = cv2.ccode2 AND m.v_id2 = cv2.v_id2
+      LEFT JOIN cropsubvariety2 csv2 ON m.sv_id2 = csv2.sv_id2
+      LEFT JOIN cropmaster3 cm3 ON m.ccode3 = cm3.ccode3
+      LEFT JOIN cropvariety3 cv3 ON m.ccode3 = cv3.ccode3 AND m.v_id3 = cv3.v_id3
+      LEFT JOIN cropsubvariety3 csv3 ON m.sv_id3 = csv3.sv_id3
+      LEFT JOIN cropmaster cm ON m.ccode = cm.ccode
+      LEFT JOIN cropvariety cv ON m.ccode = cv.ccode AND m.v_id = cv.v_id
+      LEFT JOIN cropsubvariety csv ON m.sv_id = csv.sv_id
+      LEFT JOIN addcropmaster acm ON m.accode = acm.accode
+      LEFT JOIN addcropvariety acv ON m.accode = acv.accode AND m.av_id = acv.av_id
+      LEFT JOIN addcropsubvariety acsv ON m.asv_id = acsv.asv_id
+      ORDER BY m.id
+    `;
+    
+    const [results] = await pool.promise().query(query);
+    console.timeEnd('enriched-farmers-query');
+    
+    console.log(`Enriched ${results.length} records with all lookup data`);
+    
+    // Add sno (serial number) to each record
+    const dataWithSno = results.map((row, index) => ({
+      ...row,
+      sno: index + 1
+    }));
+    
+    // Store in cache (remove if you want real-time data)
+    dataCache.set('enriched_farmers', dataWithSno);
+    
+    res.json(dataWithSno);
+    
+  } catch (error) {
+    console.error('Enriched farmers error:', error);
+    res.status(500).json({ error: 'Server error: ' + error.message });
+  }
+});
+
+
+app.get('/api/farmers/paginated', (req, res) => {
+  const page = parseInt(req.query.page) || 1;
+  const limit = parseInt(req.query.limit) || 50;
+  const offset = (page - 1) * limit;
+  
+  console.time(`paginated-farmers-${page}-${limit}`);
+  
+  // Get minimal fields only for table view
+  const query = `
+    SELECT 
+      id, farmerName, gender, age, state_scode, district_dcode,
+      isMemberinFPO, mgnrega, irrigationType,
+      totalAcresinTankfed, totalAcresinRainfed, 
+      totalAcresinBorewell, totalAcresinDripOpenWellCanalIrrigation,
+      NoofLivestockCow, NoofLivestockBuffalow, NoofLivestockGoat, NoofLivestockSheep,
+      lastyearyields1, lastyearyields2, lastyearyields3
+    FROM myfarmers_data 
+    LIMIT ? OFFSET ?
+  `;
+  
+  pool.query(query, [limit, offset], (err, results) => {
+    if (err) {
+      console.error('Paginated farmers error:', err);
+      return res.status(500).json({ error: 'Database error' });
+    }
+    
+    // Get total count in parallel
+    pool.query('SELECT COUNT(*) as total FROM myfarmers_data', (err2, countResult) => {
+      console.timeEnd(`paginated-farmers-${page}-${limit}`);
+      
+      if (err2) {
+        console.error('Count error:', err2);
+        return res.status(500).json({ error: 'Database error' });
+      }
+      
+      res.json({
+        data: results,
+        total: countResult[0].total,
+        page,
+        limit,
+        totalPages: Math.ceil(countResult[0].total / limit)
+      });
+    });
+  });
+});
+
+
+
+app.get('/api/districts-with-counts', (req, res) => {
+    const { state_scode } = req.query;
+
+    const sql = `
+        SELECT
+            d.district_dcode,
+            d.district_dname,
+            COUNT(m.id) AS memberCount,
+            COUNT(DISTINCT l.location_lcode) AS locationCount
+        FROM district d
+        LEFT JOIN location l
+            ON l.district_dcode = d.district_dcode
+        LEFT JOIN myfarmers_data m
+            ON m.district_dcode = d.district_dcode
+        WHERE d.state_scode = ?
+        GROUP BY d.district_dcode,d.district_dname
+        ORDER BY d.district_dname
+    `;
+
+    pool.query(sql,[state_scode],(err,result)=>{
+        if(err) return res.status(500).json(err);
+        res.json(result);
+    });
+});
+
+app.get('/api/locations-with-counts', (req,res)=>{
+
+    const { district_dcode } = req.query;
+
+    const sql = `
+        SELECT
+            l.location_lcode,
+            l.location_lname,
+            COUNT(m.id) memberCount,
+            COUNT(DISTINCT c.cluster_ccode) clusterCount
+        FROM location l
+        LEFT JOIN cluster c
+            ON c.location_lcode=l.location_lcode
+        LEFT JOIN myfarmers_data m
+            ON m.location_lcode=l.location_lcode
+        WHERE l.district_dcode=?
+        GROUP BY l.location_lcode,l.location_lname
+        ORDER BY l.location_lname
+    `;
+
+    pool.query(sql,[district_dcode],(err,result)=>{
+        if(err) return res.status(500).json(err);
+        res.json(result);
+    });
+
+});
+
+app.get('/api/clusters-with-counts',(req,res)=>{
+
+    const { location_lcode } = req.query;
+
+    const sql=`
+        SELECT
+            c.cluster_ccode,
+            c.cluster_cname,
+            COUNT(m.id) memberCount,
+            COUNT(DISTINCT g.group_gcode) groupCount
+        FROM cluster c
+        LEFT JOIN grp g
+            ON g.cluster_ccode=c.cluster_ccode
+        LEFT JOIN myfarmers_data m
+            ON m.cluster_ccode=c.cluster_ccode
+        WHERE c.location_lcode=?
+        GROUP BY c.cluster_ccode,c.cluster_cname
+        ORDER BY c.cluster_cname
+    `;
+
+    pool.query(sql,[location_lcode],(err,result)=>{
+        if(err) return res.status(500).json(err);
+        res.json(result);
+    });
+
+});
+
+app.get('/api/groups-with-counts',(req,res)=>{
+
+    const { cluster_ccode } = req.query;
+
+    const sql=`
+        SELECT
+            g.group_gcode,
+            g.group_cname,
+            COUNT(m.id) memberCount
+        FROM grp g
+        LEFT JOIN myfarmers_data m
+            ON m.group_gcode=g.group_gcode
+        WHERE g.cluster_ccode=?
+        GROUP BY g.group_gcode,g.group_cname
+        ORDER BY g.group_cname
+    `;
+
+    pool.query(sql,[cluster_ccode],(err,result)=>{
+        if(err) return res.status(500).json(err);
+        res.json(result);
+    });
+
+});
+
+app.get('/api/group-members',(req,res)=>{
+
+    const { group_gcode } = req.query;
+
+    const sql=`
+        SELECT *
+        FROM myfarmers_data
+        WHERE group_gcode=?
+        ORDER BY farmerName
+    `;
+
+    pool.query(sql,[group_gcode],(err,result)=>{
+        if(err) return res.status(500).json(err);
+        res.json(result);
+    });
+
+});
+
+
+// Login API Endpoint
+app.post('/api/login', (req, res) => {
+  // Now req.body should be correctly populated by bodyParser.json()
+  const { username, password } = req.body;
+
+  if (!username || !password) {
+    return res.status(400).json({ success: false, message: 'Username and password are required.' });
+  }
+
+  // Query to check credentials against websitelogin table
+  const query = 'SELECT * FROM websitelogin WHERE username = ? AND password = ?';
+  pool.query(query, [username, password], (err, results) => {
+    if (err) {
+      console.error('Database query error:', err);
+      // Send a more generic error to the client for security
+      return res.status(500).json({ success: false, message: 'Server error during login verification.' });
+    }
+
+    if (results.length > 0) {
+      // User found, login successful
+      res.json({ success: true, message: 'Login successful' });
+    } else {
+      // No user found with those credentials
+      res.status(401).json({ success: false, message: 'Invalid username or password' });
+    }
+  });
+});
+
+
+
+
+app.get('/api/user', (req, res) => {
+  const query = 'SELECT * FROM myfarmers_data';
+  pool.query(query, (err, results) => {
+    if (err) {
+      console.error('Error fetching states data:', err);
+      res.status(500).json({ error: 'Error fetching states data' });
+    } else {
+      res.json(results);
+    }
+  });
+});
+app.get('/api/state', (req, res) => {
+  const query = 'SELECT * FROM state';
+  pool.query(query, (err, results) => {
+    if (err) {
+      console.error('Error fetching states data:', err);
+      res.status(500).json({ error: 'Error fetching states data' });
+    } else {
+      res.json(results);
+    }
+  });
+});
+
+app.get('/api/district', (req, res) => {
+  const { state_scode } = req.query;
+//  console.log('State Code:', state_scode);
+  const query = 'SELECT * FROM district WHERE state_scode = ?';
+  pool.query(query, [state_scode], (err, results) => {
+    if (err) {
+      console.error('Error fetching districts data:', err);
+      res.status(500).json({ error: 'Error fetching districts data' });
+    } else {
+      res.json(results);
+    }
+  });
+});
+
+app.get('/api/location', (req, res) => {
+  const { district_dcode } = req.query;
+//  console.log('district_dcode', district_dcode);
+  const query = 'SELECT * FROM location WHERE district_dcode = ?';
+  pool.query(query, [district_dcode], (err, results) => {
+    if (err) {
+      console.error('Error fetching locations data:', err);
+      res.status(500).json({ error: 'Error fetching locations data' });
+    } else {
+      res.json(results);
+    }
+  });
+});
+
+app.get('/api/cluster', (req, res) => {
+  const { location_lcode } = req.query;
+//  console.log('location_lcode', location_lcode);
+  const query = 'SELECT * FROM cluster WHERE location_lcode=?';
+  pool.query(query, [location_lcode], (err, results) => {
+    if (err) {
+      console.error('Error fetching clusters data:', err);
+      res.status(500).json({ error: 'Error fetching clusters data' });
+    } else {
+      res.json(results);
+    }
+  });
+});
+
+app.get('/api/grp', (req, res) => {
+  const { cluster_ccode } = req.query;
+ // console.log('cluster_ccode', cluster_ccode);
+  const query = 'SELECT * FROM grp WHERE cluster_ccode=?';
+  pool.query(query, [cluster_ccode], (err, results) => {
+    if (err) {
+      console.error('Error fetching groups data:', err);
+      res.status(500).json({ error: 'Error fetching groups data' });
+    } else {
+      res.json(results);
+    }
+  });
+});
+
+app.get('/api/members', (req, res) => {
+  const { group_gcode } = req.query;
+ // console.log('group_gcode', group_gcode);
+  const query = 'SELECT * FROM members WHERE group_gcode=?';
+  pool.query(query, [group_gcode], (err, results) => {
+    if (err) {
+      console.error('Error fetching members data:', err);
+      res.status(500).json({ error: 'Error fetching members data' });
+    } else {
+      res.json(results);
+    }
+  });
+});
+
+
+app.get('/api/cropmaster', (req, res) => {
+  const query = 'SELECT * FROM cropmaster';
+  pool.query(query, (err, results) => {
+    if (err) {
+      console.error('Error fetching states data:', err);
+      res.status(500).json({ error: 'Error fetching states data' });
+    } else {
+      res.json(results);
+    }
+  });
+});
+
+app.get('/api/cropvariety', (req, res) => {
+
+  const { ccode } = req.query;
+  // console.log('ccode', ccode);
+
+  const query = 'SELECT * FROM cropvariety WHERE ccode=?';
+  pool.query(query, [ccode], (err, results) => {
+    if (err) {
+      console.error('Error fetching states data:', err);
+      res.status(500).json({ error: 'Error fetching states data' });
+    } else {
+      res.json(results);
+    }
+    
+  });
+});
+
+app.get('/api/cropsubvariety', (req, res) => {
+  const { v_id } = req.query;
+  // console.log('v_id', v_id);
+
+  const query = 'SELECT * FROM cropsubvariety WHERE v_id=?';
+  pool.query(query,  [v_id],(err, results) => {
+    if (err) {
+      console.error('Error fetching states data:', err);
+      res.status(500).json({ error: 'Error fetching states data' });
+    } else {
+      res.json(results);
+    }
+  });
+});
+
+
+app.get('/api/cropmaster1', (req, res) => {
+  const query = 'SELECT * FROM cropmaster1';
+  pool.query(query, (err, results) => {
+    if (err) {
+      console.error('Error fetching states data:', err);
+      res.status(500).json({ error: 'Error fetching states data' });
+    } else {
+      res.json(results);
+    }
+  });
+});
+
+app.get('/api/cropvariety1', (req, res) => {
+  const { ccode1 } = req.query;
+  // console.log('ccode1', ccode1);
+
+  const query = 'SELECT * FROM cropvariety1 WHERE ccode1=?';
+  pool.query(query, [ccode1], (err, results) => {
+    if (err) {
+      console.error('Error fetching states data:', err);
+      res.status(500).json({ error: 'Error fetching states data' });
+    } else {
+      res.json(results);
+    }
+  });
+});
+
+app.get('/api/cropsubvariety1', (req, res) => {
+  const { v_id1 } = req.query;
+  // console.log('v_id1', v_id1);
+
+  const query = 'SELECT * FROM cropsubvariety1 WHERE v_id1=?';
+  pool.query(query,  [v_id1],(err, results) => {
+    if (err) {
+      console.error('Error fetching states data:', err);
+      res.status(500).json({ error: 'Error fetching states data' });
+    } else {
+      res.json(results);
+    }
+  });
+});
+
+
+app.get('/api/cropmaster2', (req, res) => {
+  const query = 'SELECT * FROM cropmaster2';
+  pool.query(query, (err, results) => {
+    if (err) {
+      console.error('Error fetching states data:', err);
+      res.status(500).json({ error: 'Error fetching states data' });
+    } else {
+      res.json(results);
+    }
+  });
+});
+
+app.get('/api/cropvariety2', (req, res) => {
+  const { ccode2 } = req.query;
+  // console.log('ccode2', ccode2);
+
+  const query = 'SELECT * FROM cropvariety2 WHERE ccode2=?';
+  pool.query(query, [ccode2], (err, results) => {
+    if (err) {
+      console.error('Error fetching states data:', err);
+      res.status(500).json({ error: 'Error fetching states data' });
+    } else {
+      res.json(results);
+    }
+  });
+});
+
+app.get('/api/cropsubvariety2', (req, res) => {
+  const { v_id2 } = req.query;
+  // console.log('v_id2', v_id2);
+
+  const query = 'SELECT * FROM cropsubvariety2 WHERE v_id2=?';
+  pool.query(query,  [v_id2],(err, results) => {
+    if (err) {
+      console.error('Error fetching states data:', err);
+      res.status(500).json({ error: 'Error fetching states data' });
+    } else {
+      res.json(results);
+    }
+  });
+});
+
+
+
+app.get('/api/cropmaster3', (req, res) => {
+  const query = 'SELECT * FROM cropmaster3';
+  pool.query(query, (err, results) => {
+    if (err) {
+      console.error('Error fetching states data:', err);
+      res.status(500).json({ error: 'Error fetching states data' });
+    } else {
+      res.json(results);
+    }
+  });
+});
+
+app.get('/api/cropvariety3', (req, res) => {
+  const { ccode3 } = req.query;
+  // console.log('ccode3', ccode3);
+
+  const query = 'SELECT * FROM cropvariety3 WHERE ccode3=?';
+  pool.query(query, [ccode3], (err, results) => {
+    if (err) {
+      console.error('Error fetching states data:', err);
+      res.status(500).json({ error: 'Error fetching states data' });
+    } else {
+      res.json(results);
+    }
+  });
+});
+
+app.get('/api/cropsubvariety3', (req, res) => {
+  const { v_id3 } = req.query;
+  // console.log('v_id3', v_id3);
+
+  const query = 'SELECT * FROM cropsubvariety3 WHERE v_id3=?';
+  pool.query(query,  [v_id3],(err, results) => {
+    if (err) {
+      console.error('Error fetching states data:', err);
+      res.status(500).json({ error: 'Error fetching states data' });
+    } else { 
+      res.json(results);
+    }
+  });
+});
+
+
+app.get('/api/addcropmaster', (req, res) => {
+  const sql = 'SELECT accode, acname FROM addcropmaster';
+  pool.query(sql, (err, result) => {
+    if (err) {
+      console.error('Error fetching addcropmaster:', err);
+      return res.status(500).json({ error: 'DB error' });
+    }
+    res.json(result);
+  });
+});
+
+app.get('/api/addcropvariety', (req, res) => {
+  const { accode } = req.query;
+  const sql = 'SELECT av_id, acvariety FROM addcropvariety WHERE accode = ?';
+  pool.query(sql, [accode], (err, result) => {
+    if (err) {
+      console.error('Error fetching addcropvariety:', err);
+      return res.status(500).json({ error: 'DB error' });
+    }
+    res.json(result);
+  });
+});
+
+app.get('/api/addcropsubvariety', (req, res) => {
+  const { av_id } = req.query;
+  const sql = 'SELECT asv_id, asubvariety FROM addcropsubvariety WHERE av_id = ?';
+  pool.query(sql, [av_id], (err, result) => {
+    if (err) {
+      console.error('Error fetching addcropsubvariety:', err);
+      return res.status(500).json({ error: 'DB error' });
+    }
+    res.json(result);
+  });
+});
+
+
+
+
+app.use(bodyParser.json());
+app.use(bodyParser.urlencoded({ extended: true }));
+
+let insertCount = 0;
+let failedCount = 0;
+
+// Submit API
+app.post('/submit', (req, res) => {
+  const formData = req.body;
+//  console.log('Form data received:', formData);
+ 
+
+
+  const sql = `INSERT INTO myfarmers_data 
+  SET 
+  startMonth = '${formData.startMonth}',
+  endMonth = '${formData.endMonth}',
+  state_scode = '${formData.state_scode}',
+  district_dcode = '${formData. district_dcode}',
+  location_lcode = '${formData.location_lcode}',
+  
+  cluster_ccode = '${formData.cluster_ccode}',
+  group_gcode = '${formData. group_gcode}',
+  member_mcode = '${formData.member_mcode}',
+      nonmembername = '${formData.nonmembername}',
+age = '${formData.age}',
+ surveyno_number='${formData.surveyno_number}',
+  doorNo = '${formData.doorNo}',
+  street = '${formData.street}',
+  category1='${formData.category1}',
+  category2='${formData.category2}',
+  category3='${formData.category3}',
+  category4='${formData.category4}',
+
+
+  aadharNumber = '${formData.aadharNumber}',
+  farmerName = '${formData.farmerName}',
+  spouseName = '${formData.spouseName}',
+  fatherName = '${formData.fatherName}',
+   mgnrega = '${formData.mgnrega}',
+    stock_insurance_enrollment='${formData.stockInsuranceEnrollment}',
+
+  datebirth = '${formData.datebirth}',
+  gender='${formData.gender}',
+
+  farmerMobile = '${formData.farmerMobile}',
+  alternateNumber = '${formData.alternateNumber}',
+  isMemberinFPO = '${formData.isMemberinFPO}',
+  nameoftheFPO = '${formData.nameoftheFPO}',
+  latitude = '${formData.latitude}',
+  longitude = '${formData.longitude}',
+  irrigationType = '${formData.irrigationType}',
+  totalAcresinTankfed = '${formData.totalAcresinTankfed}',
+  areaofCultivationinTankfed = '${formData.areaofCultivationinTankfed}',
+  soilType = '${formData.soilType}',
+  landownership = '${formData.landownership}',
+  cultivationpractice = '${formData.cultivationpractice}',
+  landposition = '${formData.landposition}',
+  landtype = '${formData.landtype}',
+
+
+
+
+  
+
+  season = '${formData.season}',
+  fertilizer = '${formData.fertilizer}',
+  biofertilizer = '${formData.biofertilizer}',
+  lastyearyields = '${formData.lastyearyields}',
+  rateofsales = '${formData.rateofsales}',
+  availabilityofMachinery = '${formData.availabilityofMachinery }',
+  cropInsurance = '${formData.cropInsurance }',
+
+
+  totalAcresinRainfed = '${formData.totalAcresinRainfed}',
+  areaofCultivationinRainfed = '${formData.areaofCultivationinRainfed}',
+  soilType1 = '${formData.soilType1}',
+  landownership1 = '${formData.landownership1}',
+  cultivationpractice1 = '${formData.cultivationpractice1}',
+  landposition1 = '${formData.landposition1}',
+  landtype1 = '${formData.landtype1}',
+
+ 
+
+
+  ccode1  = '${formData.ccode1}',
+  v_id1  = '${formData.v_id1}',
+  sv_id1  = '${formData.sv_id1}',
+
+  ccode2  = '${formData.ccode2}',
+  v_id2  = '${formData.v_id2}',
+  sv_id2 = '${formData.sv_id2}',
+
+  season1 = '${formData.season1}',
+  fertilizer1 = '${formData.fertilizer1}',
+  biofertilizer1 = '${formData.biofertilizer1}',
+  lastyearyields1 = '${formData.lastyearyields1}',
+  rateofsales1 = '${formData.rateofsales1}',
+  availabilityofMachinery1 = '${formData.availabilityofMachinery1 }',
+  cropInsurance1 = '${formData.cropInsurance1 }',
+
+  totalAcresinBorewell = '${formData.totalAcresinBorewell}',
+  areaofCultivationinBorewell = '${formData.areaofCultivationinBorewell}',
+  soilType2 = '${formData.soilType2}',
+  landownership2 = '${formData.landownership2}',
+  cultivationpractice2 = '${formData.cultivationpractice2}',
+  landposition2 = '${formData.landposition2}',
+  landtype2 = '${formData.landtype2}',
+
+
+  season2= '${formData.season2}',
+  fertilizer2 = '${formData.fertilizer2}',
+  biofertilizer2 = '${formData.biofertilizer2}',
+  lastyearyields2 = '${formData.lastyearyields2}',
+  rateofsales2 = '${formData.rateofsales2}',
+  availabilityofMachinery2 = '${formData.availabilityofMachinery2 }',
+  cropInsurance2 = '${formData.cropInsurance2 }',
+
+  totalAcresinDripOpenWellCanalIrrigation = '${formData.totalAcresinDripOpenWellCanalIrrigation}',
+  areaofCultivationinDripOpenWellCanalIrrigation ='${formData.areaofCultivationinDripOpenWellCanalIrrigation}',
+  soilType3 = '${formData.soilType3}',
+  landownership3 = '${formData.landownership3}',
+  cultivationpractice3 = '${formData.cultivationpractice3}',
+  landposition3 = '${formData.landposition3}',
+  landtype3 = '${formData.landtype3}',
+
+  ccode3 = '${formData.ccode3}',
+  v_id3 = '${formData.v_id3}',
+  sv_id3 = '${formData.sv_id3}',
+
+  ccode = '${formData.ccode}',
+  v_id = '${formData.v_id}',
+  sv_id = '${formData.sv_id}',
+
+  accode = '${formData.accode}',
+  av_id = '${formData.av_id}',
+  asv_id = '${formData.asv_id}',
+
+
+  season3 = '${formData.season3}',
+
+
+  fertilizer3 = '${formData.fertilizer3}',
+  biofertilizer3 = '${formData.biofertilizer3}',
+  lastyearyields3 = '${formData.lastyearyields3}',
+  rateofsales3 = '${formData.rateofsales3}',
+  availabilityofMachinery3 = '${formData.availabilityofMachinery3 }',
+  cropInsurance3 = '${formData.cropInsurance3}',
+
+  liveStockDetails = '${formData.liveStockDetails}',
+  NoofLivestockCow = '${formData.NoofLivestockCow}',
+  VarietyBreadCow = '${formData.VarietyBreadCow}',
+  FeedingTypeCow = '${formData.FeedingTypeCow}',
+  WhetherFodderCultivatedCow = '${formData.WhetherFodderCultivatedCow}',
+  NoofMilkYieldingAnimalCow = '${formData.NoofMilkYieldingAnimalCow}',
+  MilkYieldDayAnimalCow ='${formData.MilkYieldDayAnimalCow}',
+  FrequencyofSalesCow = '${formData.FrequencyofSalesCow}',
+  AverageIncomeCow = '${formData.AverageIncomeCow}',
+  NearbyVeterinaryHospitalCow = '${formData.NearbyVeterinaryHospitalCow}',
+  AnyseasonaldiseaseoutbreakCow = '${formData.AnyseasonaldiseaseoutbreakCow}',
+  TreatmentMethodFollowedCow = '${formData.TreatmentMethodFollowedCow}',
+  NoofLivestockBuffalow = '${formData.NoofLivestockBuffalow}',
+  VarietyBreadBuffalow = '${formData.VarietyBreadBuffalow}',
+  FeedingTypeBuffalow = '${formData.FeedingTypeBuffalow}',
+  WhetherFodderCultivatedBuffalow = '${formData.WhetherFodderCultivatedBuffalow}',
+  NoofMilkYieldingAnimalBuffalow = '${formData.NoofMilkYieldingAnimalBuffalow}',
+  MilkYieldDayAnimalBuffalow = '${formData.MilkYieldDayAnimalBuffalow}',
+  FrequencyofSalesBuffalow = '${formData.FrequencyofSalesBuffalow}',
+  AverageIncomeBuffalow = '${formData.AverageIncomeBuffalow}',
+  NearbyVeterinaryHospitalBuffalow = '${formData.NearbyVeterinaryHospitalBuffalow}',
+  AnyseasonaldiseaseoutbreakBuffalow = '${formData.AnyseasonaldiseaseoutbreakBuffalow}',
+  TreatmentMethodFollowedBuffalow = '${formData.TreatmentMethodFollowedBuffalow}',
+  NoofLivestockGoat = '${formData.NoofLivestockGoat}',
+  VarietyBreadGoat = '${formData.VarietyBreadGoat}',
+  FeedingTypeGoat = '${formData.FeedingTypeGoat}',
+  WhetherFodderCultivatedGoat = '${formData.WhetherFodderCultivatedGoat}',
+  NoofMilkYieldingAnimalGoat = '${formData.NoofMilkYieldingAnimalGoat}',
+  MilkYieldDayAnimalGoat = '${formData.MilkYieldDayAnimalGoat}',
+  FrequencyofSalesGoat = '${formData.FrequencyofSalesGoat}',
+  AverageIncomeGoat = '${formData.AverageIncomeGoat}',
+  NearbyVeterinaryHospitalGoat = '${formData.NearbyVeterinaryHospitalGoat}',
+  AnyseasonaldiseaseoutbreakGoat = '${formData.AnyseasonaldiseaseoutbreakGoat}',
+  TreatmentMethodFollowedGoat = '${formData.TreatmentMethodFollowedGoat}',
+  NoofLivestockSheep = '${formData.NoofLivestockSheep}',
+  VarietyBreadSheep = '${formData.VarietyBreadSheep}',
+  FeedingTypeSheep = '${formData.FeedingTypeSheep}',
+  WhetherFodderCultivatedSheep = '${formData.WhetherFodderCultivatedSheep}',
+  NoofMilkYieldingAnimalSheep = '${formData.NoofMilkYieldingAnimalSheep}',
+  MilkYieldDayAnimalSheep = '${formData.MilkYieldDayAnimalSheep}',
+  FrequencyofSalesSheep = '${formData.FrequencyofSalesSheep}',
+  AverageIncomeSheep = '${formData.AverageIncomeSheep}',
+  NearbyVeterinaryHospitalSheep = '${formData.NearbyVeterinaryHospitalSheep}',
+  AnyseasonaldiseaseoutbreakSheep = '${formData.AnyseasonaldiseaseoutbreakSheep}',
+  TreatmentMethodFollowedSheep = '${formData.TreatmentMethodFollowedSheep}',
+  LiveStockInsuranceDetails= '${formData.LiveStockInsuranceDetails}',
+
+
+  LiveStockInsuranceDetailsCow20= '${formData.LiveStockInsuranceDetailsCow20}',
+  LiveStockInsuranceDetailsCow21= '${formData.LiveStockInsuranceDetailsCow21}',
+  LiveStockInsuranceDetailsCow22= '${formData.LiveStockInsuranceDetailsCow22}',
+  LiveStockInsuranceDetailsCow23= '${formData.LiveStockInsuranceDetailsCow23}',
+  LiveStockInsuranceDetailsCow24= '${formData.LiveStockInsuranceDetailsCow24}',
+  LiveStockInsuranceDetailsbuffalo20= '${formData.LiveStockInsuranceDetailsbuffalo20}',
+  LiveStockInsuranceDetailsbuffalo21= '${formData.LiveStockInsuranceDetailsbuffalo21}',
+  LiveStockInsuranceDetailsbuffalo22= '${formData.LiveStockInsuranceDetailsbuffalo22}',
+  LiveStockInsuranceDetailsbuffalo23= '${formData.LiveStockInsuranceDetailsbuffalo23}',
+  LiveStockInsuranceDetailsbuffalo24= '${formData.LiveStockInsuranceDetailsbuffalo24}',
+
+
+
+ LiveStockInsuranceDetailsgoat20= '${formData.LiveStockInsuranceDetailsgoat20}',
+ LiveStockInsuranceDetailsgoat21= '${formData.LiveStockInsuranceDetailsgoat21}',
+ LiveStockInsuranceDetailsgoat22= '${formData.LiveStockInsuranceDetailsgoat22}',
+LiveStockInsuranceDetailsgoat23= '${formData.LiveStockInsuranceDetailsgoat23}',
+LiveStockInsuranceDetailsgoat24= '${formData.LiveStockInsuranceDetailsgoat24}',
+
+
+  LiveStockInsuranceDetailssheep20= '${formData.LiveStockInsuranceDetailssheep20}',
+  LiveStockInsuranceDetailssheep21= '${formData.LiveStockInsuranceDetailssheep21}',
+  LiveStockInsuranceDetailssheep22= '${formData.LiveStockInsuranceDetailssheep22}',
+  LiveStockInsuranceDetailssheep23= '${formData.LiveStockInsuranceDetailssheep23}',
+  LiveStockInsuranceDetailssheep24= '${formData.LiveStockInsuranceDetailssheep24}',
+
+  irrigationtyperainfed='${formData.irrigationtyperainfed}',
+  irrigationtypeborewell='${formData.irrigationtypeborewell}',
+  irrigationtypedrip='${formData.irrigationtypedrip}',
+
+Livestockbuffalow='${formData.Livestockbuffalow}',
+Livestockgoat='${formData.Livestockgoat}',
+Livestocksheep='${formData.Livestocksheep}',
+
+
+
+  LiveStockInsuranceDetailsothers20= '${formData.LiveStockInsuranceDetailsothers20}',
+  LiveStockInsuranceDetailsothers21= '${formData.LiveStockInsuranceDetailsothers21}',
+  LiveStockInsuranceDetailsothers22= '${formData.LiveStockInsuranceDetailsothers22}',
+LiveStockInsuranceDetailsothers23= '${formData.LiveStockInsuranceDetailsothers23}',
+ LiveStockInsuranceDetailsothers24= '${formData.LiveStockInsuranceDetailsothers24}',
+  
+    Addseason1 = '${formData.Addseason1}',
+    Addfertilizer1 = '${formData.Addfertilizer1}',
+    Addbiofertilizer1 = '${formData.Addbiofertilizer1}',
+    Addlastyearyields1 = '${formData.Addlastyearyields1}',
+    Addrateofsales1 = '${formData.Addrateofsales1}',
+    AddavailabilityofMachinery1 = '${formData.AddavailabilityofMachinery1}',
+    AddcropInsurance1 = '${formData.AddcropInsurance1}';`;
+ 
+ 
+/*
+ pool.query(sql, formData, (err, result) => {
+    if (err) {
+      console.error(err);
+      res.status(500).send('Error saving data');
+      return;
+    }
+    console.log('Data added successfully');
+    res.status(200).send('Data added successfully');
+  });
+});
+
+*/
+
+pool.query(sql, formData, (err, result) => {
+    if (err) {
+      failedCount++;
+      console.error(`\n❌ Failed to insert data`);
+      console.error(`🔢 Count: ${failedCount}`);
+      console.error(`📦 Data: ${JSON.stringify(formData, null, 2)}`);
+      console.error(`🧨 Error: ${err.message}`);
+      res.status(500).send('Error saving data');
+      return;
+    }
+
+    insertCount++;
+    console.log(`✅ ${insertCount} data inserted successfully`);
+    res.status(200).send('Data added successfully');
+  });
+
+});
+
+
+// Add this to your backend
+app.get('/api/user/paginated', async (req, res) => {
+  try {
+    const { 
+      page = 1, 
+      limit = 100, 
+      search = '', 
+      state, district, location, cluster, group, memberCode, nonMemberName 
+    } = req.query;
+    
+    const offset = (parseInt(page) - 1) * parseInt(limit);
+    let query = 'SELECT * FROM myfarmers_data WHERE 1=1';
+    let countQuery = 'SELECT COUNT(*) as total FROM myfarmers_data WHERE 1=1';
+    const params = [];
+    
+    // Apply filters
+    if (state) {
+      query += ' AND state_sname = ?';
+      countQuery += ' AND state_sname = ?';
+      params.push(state);
+    }
+    if (district) {
+      query += ' AND district_name = ?';
+      countQuery += ' AND district_name = ?';
+      params.push(district);
+    }
+    if (location) {
+      query += ' AND location_name = ?';
+      countQuery += ' AND location_name = ?';
+      params.push(location);
+    }
+    if (cluster) {
+      query += ' AND cluster_name = ?';
+      countQuery += ' AND cluster_name = ?';
+      params.push(cluster);
+    }
+    if (group) {
+      query += ' AND group_name = ?';
+      countQuery += ' AND group_name = ?';
+      params.push(group);
+    }
+    if (memberCode) {
+      query += ' AND member_mcode = ?';
+      countQuery += ' AND member_mcode = ?';
+      params.push(memberCode);
+    }
+    if (nonMemberName) {
+      query += ' AND nonmembername = ?';
+      countQuery += ' AND nonmembername = ?';
+      params.push(nonMemberName);
+    }
+    if (search) {
+      query += ' AND (farmerName LIKE ? OR member_mcode LIKE ? OR nonmembername LIKE ? OR farmerMobile LIKE ?)';
+      countQuery += ' AND (farmerName LIKE ? OR member_mcode LIKE ? OR nonmembername LIKE ? OR farmerMobile LIKE ?)';
+      const searchPattern = `%${search}%`;
+      params.push(searchPattern, searchPattern, searchPattern, searchPattern);
+    }
+    
+    query += ` ORDER BY id LIMIT ${parseInt(limit)} OFFSET ${offset}`;
+    
+    const [records] = await pool.execute(query, params);
+    const [totalResult] = await pool.execute(countQuery, params.slice(0, params.length - (search ? 4 : 0)));
+    
+    res.json({
+      records,
+      total: totalResult[0].total,
+      page: parseInt(page),
+      limit: parseInt(limit),
+      hasMore: records.length === parseInt(limit)
+    });
+  } catch (error) {
+    console.error('Error in paginated API:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Export endpoint
+app.get('/api/user/export', async (req, res) => {
+  try {
+    const { search = '', state, district, location, cluster, group, memberCode, nonMemberName } = req.query;
+    
+    let query = 'SELECT * FROM myfarmers_data WHERE 1=1';
+    const params = [];
+    
+    // Apply same filters as above
+    // ... (same filter logic)
+    
+    const [records] = await pool.execute(query, params);
+    
+    // Convert to CSV
+    const csvHeaders = Object.keys(records[0] || {}).join(',');
+    const csvRows = records.map(row => Object.values(row).map(value => 
+      `"${String(value || '').replace(/"/g, '""')}"`
+    ).join(','));
+    
+    const csv = [csvHeaders, ...csvRows].join('\n');
+    
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', `attachment; filename=farmers_export_${Date.now()}.csv`);
+    res.send(csv);
+  } catch (error) {
+    console.error('Export error:', error);
+    res.status(500).json({ error: 'Export failed' });
+  }
+});
+
+
+
+// SUPER FAST DASHBOARD ENDPOINT
+app.get('/api/dashboard-fast', async (req, res) => {
+  try {
+    const start = Date.now();
+    
+    const [result] = await pool.promise().query(`
+      SELECT 
+        COUNT(*) as total,
+        SUM(CASE WHEN isMemberinFPO = 'Yes' THEN 1 ELSE 0 END) as fpo,
+        SUM(CASE WHEN mgnrega = 'Yes' THEN 1 ELSE 0 END) as mgnrega,
+        SUM(COALESCE(NoofLivestockCow,0) + COALESCE(NoofLivestockBuffalow,0) + 
+            COALESCE(NoofLivestockGoat,0) + COALESCE(NoofLivestockSheep,0)) as totalLivestock,
+        SUM(CASE WHEN irrigationType != '' OR irrigationtyperainfed != '' 
+                  OR irrigationtypeborewell != '' OR irrigationtypedrip != '' 
+             THEN 1 ELSE 0 END) as totalIrrigation,
+        ROUND(AVG(CASE WHEN age REGEXP '^[0-9]+$' THEN CAST(age AS DECIMAL) END)) as avgAge,
+        SUM(CASE WHEN gender = 'male' THEN 1 ELSE 0 END) as male,
+        SUM(CASE WHEN gender = 'female' THEN 1 ELSE 0 END) as female
+      FROM myfarmers_data
+    `);
+    
+    const timeTaken = Date.now() - start;
+    console.log(`Dashboard API: ${timeTaken}ms`);
+    
+    res.json(result);
+    
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// =============== ADD THIS FAST DASHBOARD ENDPOINT ===============
+app.get('/api/dashboard-stats', async (req, res) => {
+  try {
+    console.log('Dashboard stats requested...');
+    
+    const query = `
+      SELECT 
+        COUNT(*) as total,
+        SUM(CASE WHEN isMemberinFPO = 'Yes' THEN 1 ELSE 0 END) as fpo,
+        SUM(CASE WHEN mgnrega = 'Yes' THEN 1 ELSE 0 END) as mgnrega,
+        SUM(COALESCE(NoofLivestockCow,0) + COALESCE(NoofLivestockBuffalow,0) + 
+            COALESCE(NoofLivestockGoat,0) + COALESCE(NoofLivestockSheep,0)) as totalLivestock,
+        SUM(CASE WHEN irrigationType != '' OR irrigationtyperainfed != '' 
+                  OR irrigationtypeborewell != '' OR irrigationtypedrip != '' 
+             THEN 1 ELSE 0 END) as totalIrrigationFarmers,
+        ROUND(AVG(CASE WHEN age REGEXP '^[0-9]+$' AND age > 0 THEN CAST(age AS DECIMAL) END)) as avgAge,
+        SUM(CASE WHEN gender = 'male' THEN 1 ELSE 0 END) as male,
+        SUM(CASE WHEN gender = 'female' THEN 1 ELSE 0 END) as female,
+        SUM(CASE WHEN gender NOT IN ('male', 'female') OR gender IS NULL THEN 1 ELSE 0 END) as other
+      FROM myfarmers_data
+    `;
+    
+    pool.query(query, (err, result) => {
+      if (err) {
+        console.error('Dashboard query error:', err);
+        return res.status(500).json({ error: err.message });
+      }
+      
+      const data = result[0];
+      console.log('Dashboard stats sent:', data.total, 'records');
+      
+      res.json({
+        success: true,
+        total: data.total || 0,
+        fpo: data.fpo || 0,
+        mgnrega: data.mgnrega || 0,
+        totalLivestock: data.totalLivestock || 0,
+        totalIrrigationFarmers: data.totalIrrigationFarmers || 0,
+        avgAge: data.avgAge || 0,
+        gender: {
+          male: data.male || 0,
+          female: data.female || 0,
+          other: data.other || 0
+        }
+      });
+    });
+    
+  } catch (error) {
+    console.error('Dashboard error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+
+
+// =============== COMPLETE DASHBOARD API - WITH FIXED AGE ===============
+// =============== COMPLETE DASHBOARD API - NO RESERVED KEYWORDS ===============
+// =============== COMPLETE DASHBOARD API - ALL TABS WORKING ===============
+/*
+app.get('/api/admin-summary', (req, res) => {
+  const mainQuery = `
+    SELECT 
+      -- Basic counts
+      COUNT(*) as total,
+      SUM(CASE WHEN LOWER(isMemberinFPO) = 'yes' THEN 1 ELSE 0 END) as fpo,
+      SUM(CASE WHEN LOWER(mgnrega) = 'yes' THEN 1 ELSE 0 END) as mgnrega,
+      
+      -- Livestock
+      SUM(COALESCE(NoofLivestockCow,0) + COALESCE(NoofLivestockBuffalow,0) + 
+          COALESCE(NoofLivestockGoat,0) + COALESCE(NoofLivestockSheep,0)) as totalLivestock,
+      
+      -- Irrigation Farmers
+      SUM(CASE WHEN irrigationType != '' OR irrigationtyperainfed != '' 
+                OR irrigationtypeborewell != '' OR irrigationtypedrip != '' 
+           THEN 1 ELSE 0 END) as totalIrrigationFarmers,
+      
+      -- Average Age
+      ROUND(AVG(CASE WHEN age REGEXP '^[0-9]+$' AND age > 0 AND age < 120 
+                THEN CAST(age AS DECIMAL) END)) as avgAge,
+      
+      -- Gender
+      SUM(CASE WHEN LOWER(gender) = 'male' THEN 1 ELSE 0 END) as male,
+      SUM(CASE WHEN LOWER(gender) = 'female' THEN 1 ELSE 0 END) as female,
+      
+      -- ========== ACTIVITIES TAB ==========
+      -- Farming Only (has crops, no livestock)
+      SUM(CASE WHEN (ccode1 != '' OR ccode2 != '' OR ccode3 != '' OR ccode != '') 
+                AND (COALESCE(NoofLivestockCow,0) = 0 AND COALESCE(NoofLivestockBuffalow,0) = 0 
+                     AND COALESCE(NoofLivestockGoat,0) = 0 AND COALESCE(NoofLivestockSheep,0) = 0)
+           THEN 1 ELSE 0 END) as farmingOnly,
+      
+      -- Livestock Only (has livestock, no crops)
+      SUM(CASE WHEN (ccode1 = '' AND ccode2 = '' AND ccode3 = '' AND ccode = '') 
+                AND (COALESCE(NoofLivestockCow,0) > 0 OR COALESCE(NoofLivestockBuffalow,0) > 0 
+                     OR COALESCE(NoofLivestockGoat,0) > 0 OR COALESCE(NoofLivestockSheep,0) > 0)
+           THEN 1 ELSE 0 END) as livestockOnly,
+      
+      -- Both (has crops AND livestock)
+      SUM(CASE WHEN (ccode1 != '' OR ccode2 != '' OR ccode3 != '' OR ccode != '') 
+                AND (COALESCE(NoofLivestockCow,0) > 0 OR COALESCE(NoofLivestockBuffalow,0) > 0 
+                     OR COALESCE(NoofLivestockGoat,0) > 0 OR COALESCE(NoofLivestockSheep,0) > 0)
+           THEN 1 ELSE 0 END) as bothActivities,
+      
+      -- Alternative Livelihoods (no crops, no livestock)
+      SUM(CASE WHEN (ccode1 = '' AND ccode2 = '' AND ccode3 = '' AND ccode = '') 
+                AND (COALESCE(NoofLivestockCow,0) = 0 AND COALESCE(NoofLivestockBuffalow,0) = 0 
+                     AND COALESCE(NoofLivestockGoat,0) = 0 AND COALESCE(NoofLivestockSheep,0) = 0)
+           THEN 1 ELSE 0 END) as alternativeLivelihoods,
+      
+      -- ========== IRRIGATION TYPES TAB ==========
+      SUM(CASE WHEN LOWER(irrigationType) = 'tankfed' OR LOWER(irrigationtyperainfed) = 'tankfed' 
+                OR LOWER(irrigationtypeborewell) = 'tankfed' OR LOWER(irrigationtypedrip) = 'tankfed'
+                OR totalAcresinTankfed > 0 OR areaofCultivationinTankfed > 0
+           THEN 1 ELSE 0 END) as tankfed,
+      
+      SUM(CASE WHEN LOWER(irrigationType) = 'rainfed' OR LOWER(irrigationtyperainfed) = 'rainfed' 
+                OR LOWER(irrigationtypeborewell) = 'rainfed' OR LOWER(irrigationtypedrip) = 'rainfed'
+                OR totalAcresinRainfed > 0 OR areaofCultivationinRainfed > 0
+           THEN 1 ELSE 0 END) as rainfed,
+      
+      SUM(CASE WHEN LOWER(irrigationType) = 'borewell' OR LOWER(irrigationtyperainfed) = 'borewell' 
+                OR LOWER(irrigationtypeborewell) = 'borewell' OR LOWER(irrigationtypedrip) = 'borewell'
+                OR totalAcresinBorewell > 0 OR areaofCultivationinBorewell > 0
+           THEN 1 ELSE 0 END) as borewell,
+      
+      SUM(CASE WHEN LOWER(irrigationType) = 'drip' OR LOWER(irrigationtyperainfed) = 'drip' 
+                OR LOWER(irrigationtypeborewell) = 'drip' OR LOWER(irrigationtypedrip) = 'drip'
+                OR totalAcresinDripOpenWellCanalIrrigation > 0 
+                OR areaofCultivationinDripOpenWellCanalIrrigation > 0
+           THEN 1 ELSE 0 END) as drip,
+      
+      -- ========== YIELD CATEGORIES TAB ==========
+      SUM(CASE WHEN category1 = 'Aspirant' OR category2 = 'Aspirant' 
+                OR category3 = 'Aspirant' OR category4 = 'Aspirant'
+           THEN 1 ELSE 0 END) as aspirant,
+      
+      SUM(CASE WHEN category1 = 'Performer' OR category2 = 'Performer' 
+                OR category3 = 'Performer' OR category4 = 'Performer'
+           THEN 1 ELSE 0 END) as performer,
+      
+      SUM(CASE WHEN category1 = 'Front Runner' OR category2 = 'Front Runner' 
+                OR category3 = 'Front Runner' OR category4 = 'Front Runner'
+           THEN 1 ELSE 0 END) as frontRunner,
+      
+      SUM(CASE WHEN category1 = 'Bench Marker' OR category2 = 'Bench Marker' 
+                OR category3 = 'Bench Marker' OR category4 = 'Bench Marker'
+           THEN 1 ELSE 0 END) as benchMarker,
+      
+      SUM(CASE WHEN (category1 = '' OR category1 IS NULL) 
+                AND (category2 = '' OR category2 IS NULL)
+                AND (category3 = '' OR category3 IS NULL)
+                AND (category4 = '' OR category4 IS NULL)
+           THEN 1 ELSE 0 END) as noYield
+      
+    FROM myfarmers_data
+  `;
+
+  pool.query(mainQuery, (err, results) => {
+    if (err) {
+      console.error('Admin summary error:', err);
+      return res.status(500).json({ error: err.message });
+    }
+    
+    const data = results[0];
+    
+    res.json({
+      success: true,
+      total: data.total || 0,
+      fpo: data.fpo || 0,
+      mgnrega: data.mgnrega || 0,
+      totalLivestock: data.totalLivestock || 0,
+      totalIrrigationFarmers: data.totalIrrigationFarmers || 0,
+      avgAge: data.avgAge || 0,
+      
+      // Activities
+      farmingOnly: data.farmingOnly || 0,
+      livestockOnly: data.livestockOnly || 0,
+      both: data.bothActivities || 0,
+      alternativeLivelihoods: data.alternativeLivelihoods || 0,
+      
+      // Irrigation
+      tankfed: data.tankfed || 0,
+      rainfed: data.rainfed || 0,
+      borewell: data.borewell || 0,
+      drip: data.drip || 0,
+      
+      // Yield
+      aspirant: data.aspirant || 0,
+      performer: data.performer || 0,
+      frontRunner: data.frontRunner || 0,
+      benchMarker: data.benchMarker || 0,
+      noYield: data.noYield || 0,
+      
+      // Gender
+      male: data.male || 0,
+      female: data.female || 0,
+      other: (data.total || 0) - (data.male || 0) - (data.female || 0)
+    });
+  });
+});
+*/
+
+// =============== STATES/GEOGRAPHY API ===============
+app.get('/api/dashboard/states', (req, res) => {
+  const query = `
+    SELECT 
+      COALESCE(s.state_sname, 'Unknown') as name,
+      COUNT(DISTINCT m.id) as memberCount,
+      COUNT(DISTINCT m.district_dcode) as regionCount
+    FROM myfarmers_data m
+    LEFT JOIN state s ON m.state_scode = s.state_scode
+    WHERE m.state_scode IS NOT NULL
+    GROUP BY s.state_sname
+    ORDER BY memberCount DESC
+  `;
+  
+  pool.query(query, (err, results) => {
+    if (err) {
+      console.error('States error:', err);
+      return res.status(500).json({ error: err.message });
+    }
+    res.json(results);
+  });
+});
+// =============== COMPLETE DASHBOARD API - CORRECT CALCULATIONS ===============
+
+
+
+// ==========================================
+// NEW: COMPLETE DASHBOARD API - ADD THIS!
+// ==========================================
+// ==========================================
+// ADD THIS NEW API - COMPLETE DASHBOARD SUMMARY
+// ==========================================
+// ==========================================
+// FIXED DASHBOARD SUMMARY API
+// ==========================================
+/* app.get('/api/dashboard/summary', (req, res) => {
+  const query = `
+    SELECT 
+      -- Basic counts (using correct column names)
+      COUNT(*) as totalMembers,
+      SUM(CASE WHEN LOWER(isMemberinFPO) = 'yes' THEN 1 ELSE 0 END) as fpoCount,
+      SUM(CASE WHEN LOWER(mgnrega) = 'yes' THEN 1 ELSE 0 END) as mgnregaCount,
+      
+      -- Livestock totals
+      SUM(
+        COALESCE(CAST(NoofLivestockCow AS DECIMAL), 0) + 
+        COALESCE(CAST(NoofLivestockBuffalow AS DECIMAL), 0) + 
+        COALESCE(CAST(NoofLivestockGoat AS DECIMAL), 0) + 
+        COALESCE(CAST(NoofLivestockSheep AS DECIMAL), 0)
+      ) as totalLivestock,
+      
+      -- Age average (handle NULL and empty strings)
+      ROUND(AVG(CASE 
+        WHEN age IS NOT NULL 
+          AND age != '' 
+          AND age REGEXP '^[0-9]+$' 
+          AND CAST(age AS DECIMAL) > 0 
+          AND CAST(age AS DECIMAL) < 120 
+        THEN CAST(age AS DECIMAL) 
+        ELSE NULL 
+      END)) as averageAge,
+      
+      -- Gender counts
+      SUM(CASE WHEN LOWER(gender) = 'male' THEN 1 ELSE 0 END) as male,
+      SUM(CASE WHEN LOWER(gender) = 'female' THEN 1 ELSE 0 END) as female,
+      SUM(CASE WHEN LOWER(gender) NOT IN ('male', 'female') 
+                AND gender IS NOT NULL AND TRIM(gender) != '' THEN 1 ELSE 0 END) as other,
+      
+      -- Irrigation Types
+      SUM(CASE WHEN COALESCE(CAST(totalAcresinTankfed AS DECIMAL), 0) > 0 
+                OR COALESCE(CAST(areaofCultivationinTankfed AS DECIMAL), 0) > 0
+           THEN 1 ELSE 0 END) as tankfed,
+      
+      SUM(CASE WHEN COALESCE(CAST(totalAcresinRainfed AS DECIMAL), 0) > 0 
+                OR COALESCE(CAST(areaofCultivationinRainfed AS DECIMAL), 0) > 0
+           THEN 1 ELSE 0 END) as rainfed,
+      
+      SUM(CASE WHEN COALESCE(CAST(totalAcresinBorewell AS DECIMAL), 0) > 0 
+                OR COALESCE(CAST(areaofCultivationinBorewell AS DECIMAL), 0) > 0
+           THEN 1 ELSE 0 END) as borewell,
+      
+      SUM(CASE WHEN COALESCE(CAST(totalAcresinDripOpenWellCanalIrrigation AS DECIMAL), 0) > 0 
+                OR COALESCE(CAST(areaofCultivationinDripOpenWellCanalIrrigation AS DECIMAL), 0) > 0
+           THEN 1 ELSE 0 END) as drip,
+      
+      -- Activities
+      SUM(CASE WHEN (COALESCE(CAST(totalAcresinTankfed AS DECIMAL), 0) > 0 OR 
+                     COALESCE(CAST(totalAcresinRainfed AS DECIMAL), 0) > 0 OR
+                     COALESCE(CAST(totalAcresinBorewell AS DECIMAL), 0) > 0 OR 
+                     COALESCE(CAST(totalAcresinDripOpenWellCanalIrrigation AS DECIMAL), 0) > 0)
+                AND (COALESCE(CAST(NoofLivestockCow AS DECIMAL), 0) = 0 AND 
+                     COALESCE(CAST(NoofLivestockBuffalow AS DECIMAL), 0) = 0 AND
+                     COALESCE(CAST(NoofLivestockGoat AS DECIMAL), 0) = 0 AND 
+                     COALESCE(CAST(NoofLivestockSheep AS DECIMAL), 0) = 0)
+           THEN 1 ELSE 0 END) as farmingOnly,
+      
+      SUM(CASE WHEN (COALESCE(CAST(NoofLivestockCow AS DECIMAL), 0) > 0 OR 
+                     COALESCE(CAST(NoofLivestockBuffalow AS DECIMAL), 0) > 0 OR
+                     COALESCE(CAST(NoofLivestockGoat AS DECIMAL), 0) > 0 OR 
+                     COALESCE(CAST(NoofLivestockSheep AS DECIMAL), 0) > 0)
+                AND (COALESCE(CAST(totalAcresinTankfed AS DECIMAL), 0) = 0 AND 
+                     COALESCE(CAST(totalAcresinRainfed AS DECIMAL), 0) = 0 AND
+                     COALESCE(CAST(totalAcresinBorewell AS DECIMAL), 0) = 0 AND 
+                     COALESCE(CAST(totalAcresinDripOpenWellCanalIrrigation AS DECIMAL), 0) = 0)
+           THEN 1 ELSE 0 END) as livestockOnly,
+      
+      SUM(CASE WHEN (COALESCE(CAST(totalAcresinTankfed AS DECIMAL), 0) > 0 OR 
+                     COALESCE(CAST(totalAcresinRainfed AS DECIMAL), 0) > 0 OR
+                     COALESCE(CAST(totalAcresinBorewell AS DECIMAL), 0) > 0 OR 
+                     COALESCE(CAST(totalAcresinDripOpenWellCanalIrrigation AS DECIMAL), 0) > 0)
+                AND (COALESCE(CAST(NoofLivestockCow AS DECIMAL), 0) > 0 OR 
+                     COALESCE(CAST(NoofLivestockBuffalow AS DECIMAL), 0) > 0 OR
+                     COALESCE(CAST(NoofLivestockGoat AS DECIMAL), 0) > 0 OR 
+                     COALESCE(CAST(NoofLivestockSheep AS DECIMAL), 0) > 0)
+           THEN 1 ELSE 0 END) as bothActivities,
+      
+      SUM(CASE WHEN (COALESCE(CAST(totalAcresinTankfed AS DECIMAL), 0) = 0 AND 
+                     COALESCE(CAST(totalAcresinRainfed AS DECIMAL), 0) = 0 AND
+                     COALESCE(CAST(totalAcresinBorewell AS DECIMAL), 0) = 0 AND 
+                     COALESCE(CAST(totalAcresinDripOpenWellCanalIrrigation AS DECIMAL), 0) = 0)
+                AND (COALESCE(CAST(NoofLivestockCow AS DECIMAL), 0) = 0 AND 
+                     COALESCE(CAST(NoofLivestockBuffalow AS DECIMAL), 0) = 0 AND
+                     COALESCE(CAST(NoofLivestockGoat AS DECIMAL), 0) = 0 AND 
+                     COALESCE(CAST(NoofLivestockSheep AS DECIMAL), 0) = 0)
+           THEN 1 ELSE 0 END) as alternativeLivelihoods,
+      
+      -- Total Irrigation Farmers
+      SUM(CASE WHEN (COALESCE(CAST(totalAcresinTankfed AS DECIMAL), 0) > 0 OR 
+                     COALESCE(CAST(totalAcresinRainfed AS DECIMAL), 0) > 0 OR
+                     COALESCE(CAST(totalAcresinBorewell AS DECIMAL), 0) > 0 OR 
+                     COALESCE(CAST(totalAcresinDripOpenWellCanalIrrigation AS DECIMAL), 0) > 0)
+             THEN 1 ELSE 0 END) as totalIrrigationFarmers,
+      
+      -- Yield Categories
+      SUM(CASE WHEN (COALESCE(CAST(totalAcresinTankfed AS DECIMAL), 0) > 0 OR 
+                     COALESCE(CAST(totalAcresinRainfed AS DECIMAL), 0) > 0 OR
+                     COALESCE(CAST(totalAcresinBorewell AS DECIMAL), 0) > 0 OR 
+                     COALESCE(CAST(totalAcresinDripOpenWellCanalIrrigation AS DECIMAL), 0) > 0)
+                AND GREATEST(COALESCE(CAST(lastyearyields1 AS DECIMAL), 0), 
+                             COALESCE(CAST(lastyearyields2 AS DECIMAL), 0), 
+                             COALESCE(CAST(lastyearyields3 AS DECIMAL), 0)) > 0 
+                AND GREATEST(COALESCE(CAST(lastyearyields1 AS DECIMAL), 0), 
+                             COALESCE(CAST(lastyearyields2 AS DECIMAL), 0), 
+                             COALESCE(CAST(lastyearyields3 AS DECIMAL), 0)) < 2500
+           THEN 1 ELSE 0 END) as aspirant,
+      
+      SUM(CASE WHEN (COALESCE(CAST(totalAcresinTankfed AS DECIMAL), 0) > 0 OR 
+                     COALESCE(CAST(totalAcresinRainfed AS DECIMAL), 0) > 0 OR
+                     COALESCE(CAST(totalAcresinBorewell AS DECIMAL), 0) > 0 OR 
+                     COALESCE(CAST(totalAcresinDripOpenWellCanalIrrigation AS DECIMAL), 0) > 0)
+                AND GREATEST(COALESCE(CAST(lastyearyields1 AS DECIMAL), 0), 
+                             COALESCE(CAST(lastyearyields2 AS DECIMAL), 0), 
+                             COALESCE(CAST(lastyearyields3 AS DECIMAL), 0)) >= 2500
+                AND GREATEST(COALESCE(CAST(lastyearyields1 AS DECIMAL), 0), 
+                             COALESCE(CAST(lastyearyields2 AS DECIMAL), 0), 
+                             COALESCE(CAST(lastyearyields3 AS DECIMAL), 0)) < 2600
+           THEN 1 ELSE 0 END) as performer,
+      
+      SUM(CASE WHEN (COALESCE(CAST(totalAcresinTankfed AS DECIMAL), 0) > 0 OR 
+                     COALESCE(CAST(totalAcresinRainfed AS DECIMAL), 0) > 0 OR
+                     COALESCE(CAST(totalAcresinBorewell AS DECIMAL), 0) > 0 OR 
+                     COALESCE(CAST(totalAcresinDripOpenWellCanalIrrigation AS DECIMAL), 0) > 0)
+                AND GREATEST(COALESCE(CAST(lastyearyields1 AS DECIMAL), 0), 
+                             COALESCE(CAST(lastyearyields2 AS DECIMAL), 0), 
+                             COALESCE(CAST(lastyearyields3 AS DECIMAL), 0)) >= 2600
+                AND GREATEST(COALESCE(CAST(lastyearyields1 AS DECIMAL), 0), 
+                             COALESCE(CAST(lastyearyields2 AS DECIMAL), 0), 
+                             COALESCE(CAST(lastyearyields3 AS DECIMAL), 0)) < 2800
+           THEN 1 ELSE 0 END) as frontRunner,
+      
+      SUM(CASE WHEN (COALESCE(CAST(totalAcresinTankfed AS DECIMAL), 0) > 0 OR 
+                     COALESCE(CAST(totalAcresinRainfed AS DECIMAL), 0) > 0 OR
+                     COALESCE(CAST(totalAcresinBorewell AS DECIMAL), 0) > 0 OR 
+                     COALESCE(CAST(totalAcresinDripOpenWellCanalIrrigation AS DECIMAL), 0) > 0)
+                AND GREATEST(COALESCE(CAST(lastyearyields1 AS DECIMAL), 0), 
+                             COALESCE(CAST(lastyearyields2 AS DECIMAL), 0), 
+                             COALESCE(CAST(lastyearyields3 AS DECIMAL), 0)) >= 2800
+           THEN 1 ELSE 0 END) as benchMarker,
+      
+      SUM(CASE WHEN (COALESCE(CAST(totalAcresinTankfed AS DECIMAL), 0) > 0 OR 
+                     COALESCE(CAST(totalAcresinRainfed AS DECIMAL), 0) > 0 OR
+                     COALESCE(CAST(totalAcresinBorewell AS DECIMAL), 0) > 0 OR 
+                     COALESCE(CAST(totalAcresinDripOpenWellCanalIrrigation AS DECIMAL), 0) > 0)
+                AND GREATEST(COALESCE(CAST(lastyearyields1 AS DECIMAL), 0), 
+                             COALESCE(CAST(lastyearyields2 AS DECIMAL), 0), 
+                             COALESCE(CAST(lastyearyields3 AS DECIMAL), 0)) = 0
+           THEN 1 ELSE 0 END) as noYieldData
+          
+    FROM myfarmers_data
+  `;
+
+  pool.query(query, (err, result) => {
+    if (err) {
+      console.error('Dashboard summary error:', err);
+      return res.status(500).json({ error: err.message });
+    }
+    
+    const summary = result[0];
+    
+    
+    res.json({
+      totalMembers: summary.totalMembers || 0,
+      fpoCount: summary.fpoCount || 0,
+      mgnregaCount: summary.mgnregaCount || 0,
+      totalLivestock: summary.totalLivestock || 0,
+      averageAge: summary.averageAge ? summary.averageAge.toString() : '0',
+      totalIrrigationFarmers: summary.totalIrrigationFarmers || 0,
+      
+      farmingOnly: summary.farmingOnly || 0,
+      livestockOnly: summary.livestockOnly || 0,
+      both: summary.bothActivities || 0,
+      alternativeLivelihoods: summary.alternativeLivelihoods || 0,
+      
+      tankfed: summary.tankfed || 0,
+      rainfed: summary.rainfed || 0,
+      borewell: summary.borewell || 0,
+      drip: summary.drip || 0,
+      
+      aspirant: summary.aspirant || 0,
+      performer: summary.performer || 0,
+      frontRunner: summary.frontRunner || 0,
+      benchMarker: summary.benchMarker || 0,
+      noYield: summary.noYieldData || 0,
+      
+      male: summary.male || 0,
+      female: summary.female || 0,
+      other: summary.other || 0
+    });
+  });
+});
+
+// ==========================================
+*/
+
+
+
+
+
+
+// Start server
+app.listen(port,'0.0.0.0', () => {
+  console.log(`Server running on port ${port}`);
+});
+
+
+//docker
+// const port = process.env.PORT || 5002;
+// // Start server
+// app.listen(port,'0.0.0.0', () => {
+//   console.log(`Server running on port ${\port}`);
+// });
+
+
+
+
+
+
+
+
